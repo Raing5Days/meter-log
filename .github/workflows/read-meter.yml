@@ -1,0 +1,87 @@
+name: read-meter
+
+on:
+  schedule:
+    - cron: "5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: read-meter
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read meter and merge into history
+        shell: python
+        run: |
+          import json, re, time, urllib.request
+
+          URL = "https://www.wap.cnyiot.com/nat/pay.aspx?mid=19100424977"
+          MERGE_WINDOW = 10 * 60 * 1000
+          MAX_ENTRIES = 2200
+
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+
+          def grab(html, label):
+              m = re.search(label + r"[\s\S]{0,160}?<label[^>]*>([^<]*)</label>", html)
+              return m.group(1).strip() if m else None
+
+          def num(s):
+              if s is None:
+                  return None
+              try:
+                  return float(s)
+              except ValueError:
+                  return None
+
+          reading = None
+          for attempt in range(3):
+              try:
+                  req = urllib.request.Request(URL, headers=UA)
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      html = r.read().decode("utf-8", "replace")
+                  kwh = grab(html, "剩余电量")
+                  money = grab(html, "剩余金额")
+                  price = grab(html, "综合费用")
+                  if kwh is None or money is None:
+                      raise RuntimeError("page structure changed, parse failed")
+                  reading = {"ts": int(time.time() * 1000), "kwh": num(kwh), "money": num(money), "price": num(price)}
+                  break
+              except Exception as e:
+                  print(f"attempt {attempt + 1} failed: {e}")
+                  time.sleep(10)
+          if reading is None:
+              raise SystemExit("meter read failed after 3 attempts")
+
+          try:
+              with open("history.json", "r", encoding="utf-8") as f:
+                  hist = json.load(f)
+          except Exception:
+              hist = []
+          last = hist[-1] if hist else None
+          if last and reading["ts"] - last["ts"] < MERGE_WINDOW:
+              hist[-1] = reading
+          else:
+              hist.append(reading)
+          with open("history.json", "w", encoding="utf-8") as f:
+              json.dump(hist[-MAX_ENTRIES:], f, ensure_ascii=False, separators=(",", ":"))
+          print("recorded:", reading)
+
+      - name: Commit and push
+        run: |
+          git config user.name "meter-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          if git diff --cached --quiet; then
+            echo "no change"
+          else
+            git commit -m "meter reading $(date -u +%FT%TZ)"
+            git push
+          fi
