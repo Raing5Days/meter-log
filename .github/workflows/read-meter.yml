@@ -14,24 +14,29 @@ concurrency:
 jobs:
   read:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
       - name: Read meter and merge into history
         shell: python
         run: |
-          import json, re, time, urllib.request
+          import json, re, subprocess, time, urllib.parse, urllib.request
 
           URL = "https://www.wap.cnyiot.com/nat/pay.aspx?mid=19100424977"
           MERGE_WINDOW = 10 * 60 * 1000
           MAX_ENTRIES = 2200
+          UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+          Q = urllib.parse.quote(URL, safe="")
 
-          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
-
-          def grab(html, label):
-              m = re.search(label + r"[\s\S]{0,160}?<label[^>]*>([^<]*)</label>", html)
-              return m.group(1).strip() if m else None
+          # 依次尝试：直连(curl) → 直连(urllib+全头) → 公共代理
+          TARGETS = [
+              ("curl", URL),
+              ("urllib", URL),
+              ("urllib", "https://r.jina.ai/" + URL),
+              ("urllib", "https://api.allorigins.win/raw?url=" + Q),
+              ("urllib", "https://api.codetabs.com/v1/proxy?quest=" + Q),
+          ]
 
           def num(s):
               if s is None:
@@ -41,38 +46,63 @@ jobs:
               except ValueError:
                   return None
 
-          reading = None
-          for attempt in range(3):
-              try:
-                  req = urllib.request.Request(URL, headers=UA)
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      html = r.read().decode("utf-8", "replace")
-                  kwh = grab(html, "剩余电量")
-                  money = grab(html, "剩余金额")
-                  price = grab(html, "综合费用")
-                  if kwh is None or money is None:
-                      raise RuntimeError("page structure changed, parse failed")
-                  reading = {"ts": int(time.time() * 1000), "kwh": num(kwh), "money": num(money), "price": num(price)}
+          def extract(text):
+              def grab(label):
+                  m = re.search(label + r"[\s\S]{0,160}?(?:<label[^>]*>|[:：]\s*)([0-9]+(?:\.[0-9]+)?)", text)
+                  return m.group(1) if m else None
+              kwh, money, price = num(grab("剩余电量")), num(grab("剩余金额")), num(grab("综合费用"))
+              return (kwh, money, price) if money is not None else None
+
+          reading, source = None, None
+          for how, target in TARGETS:
+              for attempt in range(2):
+                  try:
+                      if how == "curl":
+                          p = subprocess.run(
+                              ["curl", "-sS", "-L", "--max-time", "20", "-A", UA,
+                               "-H", "Accept: text/html,application/xhtml+xml,*/*;q=0.8",
+                               "-H", "Accept-Language: zh-CN,zh;q=0.9", target],
+                              capture_output=True, text=True, timeout=25)
+                          body = p.stdout if p.returncode == 0 else ""
+                      else:
+                          req = urllib.request.Request(target, headers={
+                              "User-Agent": UA,
+                              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                              "Accept-Language": "zh-CN,zh;q=0.9"})
+                          with urllib.request.urlopen(req, timeout=20) as r:
+                              body = r.read().decode("utf-8", "replace")
+                      parsed = extract(body)
+                      if parsed:
+                          reading, source = parsed, f"{how}:{target}"
+                          break
+                      print(f"[{target}] fetched but no match ({len(body)} bytes)")
+                  except Exception as e:
+                      print(f"[{target}] attempt {attempt + 1} failed: {e}")
+                  time.sleep(5)
+              if reading:
                   break
-              except Exception as e:
-                  print(f"attempt {attempt + 1} failed: {e}")
-                  time.sleep(10)
+
           if reading is None:
-              raise SystemExit("meter read failed after 3 attempts")
+              raise SystemExit("meter read failed via all sources: " + ", ".join(t for _, t in TARGETS))
+
+          kwh, money, price = reading
+          print(f"source: {source}")
+          print(f"recorded: money={money} kwh={kwh} price={price}")
 
           try:
               with open("history.json", "r", encoding="utf-8") as f:
                   hist = json.load(f)
           except Exception:
               hist = []
+          now = int(time.time() * 1000)
+          entry = {"ts": now, "kwh": kwh, "money": money, "price": price}
           last = hist[-1] if hist else None
-          if last and reading["ts"] - last["ts"] < MERGE_WINDOW:
-              hist[-1] = reading
+          if last and now - last["ts"] < MERGE_WINDOW:
+              hist[-1] = entry
           else:
-              hist.append(reading)
+              hist.append(entry)
           with open("history.json", "w", encoding="utf-8") as f:
               json.dump(hist[-MAX_ENTRIES:], f, ensure_ascii=False, separators=(",", ":"))
-          print("recorded:", reading)
 
       - name: Commit and push
         run: |
